@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -17,6 +18,12 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type SortedKey []KeyValue
+
+func (s SortedKey) Len() int           { return len(s) }
+func (s SortedKey) Less(i, j int) bool { return s[i].Key < s[j].Key }
+func (s SortedKey) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -42,7 +49,13 @@ func Worker(mapf func(string, string) []KeyValue,
 		case MapTask:
 			{
 				DoMapTask(mapf, &task)
-				callDone(task.TaskId)
+				callDone(&task)
+			}
+
+		case ReduceTask:
+			{
+				DoReduceTask(reducef, &task)
+				callDone(&task)
 			}
 
 		case WaitTask:
@@ -67,17 +80,17 @@ func GetTask() Task {
 	ok := call("Coordinator.PollTask", &args, &reply)
 
 	if ok {
-		fmt.Println(reply)
+		fmt.Printf("Receive a task, task type:%v, taskId:%v\n", reply.TaskType, reply.TaskId)
 	} else {
-		fmt.Println("call fail!")
+		fmt.Println("Fail to get a task!")
 	}
 
 	return reply
 }
 
-// DoMapTask does the core work of using map function to handle the task.
+// DoMapTask does the core work of using map function.
 func DoMapTask(mapf func(string, string) []KeyValue, task *Task) {
-	var filename string = task.FileName
+	var filename string = task.FileNames[0]
 
 	file, err := os.Open(filename)
 	if err != nil {
@@ -120,16 +133,70 @@ func DoMapTask(mapf func(string, string) []KeyValue, task *Task) {
 	}
 }
 
+// DoReduceTask does the core work of using reduce function.
+func DoReduceTask(reducef func(string, []string) string, task *Task) {
+	intermediate := shuffle(task.FileNames)
+
+	dir, _ := os.Getwd()
+	tmpFile, err := os.CreateTemp(dir, "mr-tmp-reduce-*")
+	if err != nil {
+		log.Fatal("Failed to create temp file", err)
+	}
+
+	// Collect values of the same key.
+	i := 0
+	for i < len(intermediate) {
+		var values []string
+		j := i
+		for j < len(intermediate) && intermediate[i].Key == intermediate[j].Key {
+			values = append(values, intermediate[j].Value)
+			j++
+		}
+		// apply reduce function
+		res := reducef(intermediate[i].Key, values)
+		fmt.Fprintf(tmpFile, "%v %v\n", intermediate[i].Key, res)
+		i = j
+	}
+
+	// Close and rename tmpFile.
+	tmpFile.Close()
+	fn := fmt.Sprintf("mr-out-%d", task.TaskId)
+	os.Rename(tmpFile.Name(), fn)
+}
+
+// shuffle reads all
+func shuffle(files []string) []KeyValue {
+	var kvpairs []KeyValue
+
+	// Read files and add KV to kvpairs.
+	for _, fn := range files {
+		file, err := os.Open(fn)
+		if err != nil {
+			continue
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kvpairs = append(kvpairs, kv)
+		}
+		file.Close()
+	}
+
+	sort.Sort(SortedKey(kvpairs))
+	return kvpairs
+}
+
 // Call rpc to mark task as completed.
-func callDone(taskId int) Task {
-	args := Task{}
+func callDone(task *Task) Task {
 	reply := Task{}
 
-	args.TaskId = taskId
-	ok := call("Coordinator.MarkFinished", &args, &reply)
+	ok := call("Coordinator.MarkFinished", task, &reply)
 
 	if ok {
-		fmt.Println(reply)
+		// fmt.Println(reply)
 	} else {
 		fmt.Println("call fail!")
 	}

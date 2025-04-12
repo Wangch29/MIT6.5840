@@ -6,8 +6,10 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 type TaskArgs struct{}
 
@@ -43,7 +45,7 @@ type Task struct {
 	TaskType  TaskType // Task type, map or reduce.
 	TaskId    int      // Task id
 	ReduceNum int      // Number of reducers.
-	FileName  string   // Input filename.
+	FileNames []string // Input filename.
 }
 
 //
