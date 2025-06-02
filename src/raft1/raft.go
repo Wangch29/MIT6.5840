@@ -391,9 +391,10 @@ func (rf *Raft) ticker() {
 		}
 
 		rf.received = false
+		isLeader := rf.state == Leader
 		rf.mu.Unlock()
 
-		if rf.state == Leader {
+		if isLeader {
 			time.Sleep(time.Duration(50) * time.Millisecond)
 		} else {
 			ms := 150 + rand.Intn(151)
