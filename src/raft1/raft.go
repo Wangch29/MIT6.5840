@@ -596,10 +596,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	// log.Printf("[Node %v] received append entries from %v at term %v\n", rf.me, args.LeaderID, args.Term)
+	reply.Term = rf.currentTerm
 
 	// args's term is too old.
 	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	// current node has exceed, return.
+	if rf.lastApplied > args.PrevLogIndex { // todo: add feedback param.
 		reply.Success = false
 		return
 	}
