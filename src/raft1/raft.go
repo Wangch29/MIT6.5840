@@ -9,6 +9,8 @@ package raft
 import (
 	//	"bytes"
 	//"log"
+	"bytes"
+	"log"
 	"math/rand"
 	"sort"
 	"sync"
@@ -16,16 +18,14 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
 )
 
-type term_t uint32
-type log_index_t uint64
-
 type logEntry struct {
-	Term    term_t      // The term when this entry was received by the leader.
+	Term    int         // The term when this entry was received by the leader.
 	Command interface{} // The command to be applied to the state machine.
 }
 
@@ -38,6 +38,13 @@ const (
 	Leader
 )
 
+// States need to be persistent.
+type PersistentState struct {
+	CurrentTerm int
+	VotedFor    int
+	Log         []logEntry
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -47,7 +54,7 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	state       StateType
-	currentTerm term_t
+	currentTerm int
 	log         []logEntry
 	commitIndex int
 	lastApplied int
@@ -63,16 +70,16 @@ type Raft struct {
 }
 
 type AppendEntriesArgs struct {
-	Term         term_t
+	Term         int
 	LeaderID     int
 	PrevLogIndex int
-	PrevLogTerm  term_t
+	PrevLogTerm  int
 	Entries      []logEntry // log entries to store(empty for heartbeat)
 	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
-	Term    term_t
+	Term    int
 	Success bool
 	// Optional for log backtracking:
 	ConflictIndex int
@@ -101,35 +108,38 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
+// Call it with holding mutex.
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(PersistentState{
+		CurrentTerm: rf.currentTerm,
+		VotedFor:    rf.votedFor,
+		Log:         rf.log,
+	})
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) == 0 { // bootstrap without any state?
 		return
 	}
 	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var ps PersistentState
+	if d.Decode(&ps) != nil {
+		log.Printf("Fail to decode.\n")
+		return
+	} else {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		rf.currentTerm = ps.CurrentTerm
+		rf.votedFor = ps.VotedFor
+		rf.log = ps.Log
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -152,15 +162,15 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	CandidateID  int
-	CurrentTerm  term_t
+	CurrentTerm  int
 	LastLogIndex int
-	LastLogTerm  term_t
+	LastLogTerm  int
 }
 
 // RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
-	Term        term_t
+	Term        int
 	VoteGranted bool // Vote for this candidate or not.
 }
 
@@ -170,19 +180,19 @@ func (rf *Raft) getLastLogIndex() int {
 }
 
 // Get the term of last log.
-func (rf *Raft) getLastLogTerm() term_t {
+func (rf *Raft) getLastLogTerm() int {
 	if len(rf.log) == 0 {
 		return 0
 	}
-	return term_t(rf.log[len(rf.log)-1].Term)
+	return rf.log[len(rf.log)-1].Term
 }
 
 // Get the term of log at given index.
-func (rf *Raft) getLogTerm(index int) term_t {
+func (rf *Raft) getLogTerm(index int) int {
 	if index < 0 || index >= len(rf.log) {
 		return 0
 	}
-	return term_t(rf.log[index].Term)
+	return rf.log[index].Term
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -192,7 +202,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.persist()
 }
 
-func (rf *Raft) becomeFollower(term term_t) {
+func (rf *Raft) becomeFollower(term int) {
 	rf.state = Follower
 	if term > rf.currentTerm {
 		rf.currentTerm = term
@@ -292,8 +302,8 @@ func (rf *Raft) broadcastHeartbeats() {
 				// If follower's log is up-to-date, update nextIndex and matchIndex.
 				if reply.Success {
 					// log.Printf("[Node %v] Append entries to Node [%v] at term %v\n", rf.me, i, rf.currentTerm)
-					rf.nextIndex[i] = args.PrevLogIndex + len(args.Entries) + 1
 					rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
+					rf.nextIndex[i] = rf.matchIndex[i] + 1
 					rf.updateCommitIndex()
 					rf.mu.Unlock()
 					return
@@ -304,13 +314,14 @@ func (rf *Raft) broadcastHeartbeats() {
 				} else {
 					// Unsuccessful, decrease nextIndex and retry.
 					if reply.ConflictTerm != -1 {
-						if rf.findTerm(term_t(reply.ConflictTerm)) {
-							rf.nextIndex[i] = reply.ConflictIndex + 1
+						has, idx := rf.findTerm(reply.ConflictTerm)
+						if has {
+							rf.nextIndex[i] = idx + 1
 						} else {
 							rf.nextIndex[i] = reply.ConflictIndex
 						}
 					} else {
-						rf.nextIndex[i] -= reply.ConflictLen
+						rf.nextIndex[i] = reply.ConflictLen
 					}
 					rf.mu.Unlock()
 					// keep looping until success.
@@ -320,17 +331,17 @@ func (rf *Raft) broadcastHeartbeats() {
 	}
 }
 
-func (rf *Raft) findTerm(term term_t) bool {
+func (rf *Raft) findTerm(term int) (bool, int) {
 	for i := len(rf.log) - 1; i >= 0; i-- {
 		t := rf.getLogTerm(i)
 		if t == term {
-			return true
+			return true, i
 		}
 		if t < term {
-			return false
+			return false, -1
 		}
 	}
-	return false
+	return false, -1
 }
 
 // RequestVote RPC handler.
@@ -436,7 +447,7 @@ func (rf *Raft) startElection() {
 		CandidateID:  rf.me,
 		CurrentTerm:  rf.currentTerm,
 		LastLogIndex: rf.getLastLogIndex(),
-		LastLogTerm:  term_t(rf.getLastLogTerm()),
+		LastLogTerm:  rf.getLastLogTerm(),
 	}
 
 	var count int32 = 1
@@ -637,7 +648,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex > rf.getLastLogIndex() {
 		reply.Success = false
 		reply.ConflictTerm = -1
-		reply.ConflictLen = args.PrevLogIndex - rf.getLastLogIndex()
+		reply.ConflictLen = len(rf.log)
 		return
 	}
 	// Check logEntry's term.
