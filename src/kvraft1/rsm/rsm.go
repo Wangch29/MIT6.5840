@@ -1,25 +1,24 @@
 package rsm
 
 import (
+	// "log"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
 	"6.5840/raft1"
 	"6.5840/raftapi"
 	"6.5840/tester1"
-
 )
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
 
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Id  int
+	Me  int
+	Req any
 }
-
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -40,7 +39,7 @@ type RSM struct {
 	applyCh      chan raftapi.ApplyMsg
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
-	// Your definitions here.
+	notifyCh     map[int]chan any
 }
 
 // servers[] contains the ports of the set of
@@ -68,23 +67,70 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	rsm.notifyCh = make(map[int]chan any)
+	go rsm.applier()
 	return rsm
+}
+
+func (rsm *RSM) applier() {
+	for msg := range rsm.applyCh {
+		rsm.mu.Lock()
+		if msg.CommandValid {
+			op := msg.Command.(Op)
+			result := rsm.sm.DoOp(op.Req)
+			// log.Printf("RSM[%d] applying op %v at index %d", rsm.me, op, msg.CommandIndex)
+			if ch, ok := rsm.notifyCh[msg.CommandIndex]; ok {
+				if op.Me == rsm.me {
+					ch <- result
+				} else {
+					ch <- nil // not my op, so return nil
+				}
+				delete(rsm.notifyCh, msg.CommandIndex)
+			}
+		} else if msg.SnapshotValid {
+			rsm.sm.Restore(msg.Snapshot)
+		}
+		rsm.mu.Unlock()
+	}
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
 
-
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
 // try again.
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
-
 	// Submit creates an Op structure to run a command through Raft;
 	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
 	// is the argument to Submit and id is a unique id for the op.
+	op := Op{
+		Me:  rsm.me,
+		Req: req,
+	}
 
-	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	idx, _, isLeader := rsm.rf.Start(op)
+	if !isLeader {
+		return rpc.ErrWrongLeader, nil
+	}
+	// log.Printf("RSM[%d] submitted op %v at index %d", rsm.me, op, idx)
+
+	rsm.mu.Lock()
+	ch := make(chan any, 1)
+	rsm.notifyCh[idx] = ch
+	rsm.mu.Unlock()
+
+	select {
+	case result := <-ch:
+		if result == nil {
+			return rpc.ErrWrongLeader, nil
+		}
+		return rpc.OK, result
+	case <-time.After(2000 * time.Millisecond):
+		rsm.mu.Lock()
+		delete(rsm.notifyCh, idx)
+		rsm.mu.Unlock()
+		return rpc.ErrWrongLeader, nil
+	}
 }
