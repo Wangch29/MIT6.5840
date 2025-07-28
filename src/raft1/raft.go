@@ -477,7 +477,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateID
 			reply.VoteGranted = true
 			rf.persist()
-			// log.Printf("[Node %v] Votes for %v at term %v\n", rf.me, args.CandidateID, args.CurrentTerm)
 			return
 		}
 	}
@@ -623,8 +622,6 @@ func (rf *Raft) ElectionTicker() {
 	for !rf.killed() {
 		rf.mu.Lock()
 
-		// log.Printf("[Node %v] ticker started, state: %v, received:%v\n", rf.me, rf.state, rf.received)
-
 		if rf.state != Leader && !rf.received {
 			rf.becomeCandidate()
 			rf.startElection()
@@ -646,7 +643,7 @@ func (rf *Raft) broadcastTicker() {
 			rf.broadcastHeartbeats()
 		}
 		rf.mu.Unlock()
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 
@@ -670,7 +667,7 @@ func (rf *Raft) applyTicker() {
 			rf.applyChan <- msg
 		}
 
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

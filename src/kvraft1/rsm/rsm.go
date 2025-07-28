@@ -1,15 +1,14 @@
 package rsm
 
 import (
-	// "log"
 	"sync"
 	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
-	"6.5840/raft1"
+	raft "6.5840/raft1"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
@@ -68,29 +67,51 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
 	rsm.notifyCh = make(map[int]chan any)
+
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		rsm.sm.Restore(snapshot)
+	}
+
 	go rsm.applier()
 	return rsm
 }
 
 func (rsm *RSM) applier() {
 	for msg := range rsm.applyCh {
-		rsm.mu.Lock()
 		if msg.CommandValid {
+			rsm.mu.Lock()
 			op := msg.Command.(Op)
+			ch, hasCh := rsm.notifyCh[msg.CommandIndex]
+			me := rsm.me
+			rsm.mu.Unlock()
+
 			result := rsm.sm.DoOp(op.Req)
-			// log.Printf("RSM[%d] applying op %v at index %d", rsm.me, op, msg.CommandIndex)
-			if ch, ok := rsm.notifyCh[msg.CommandIndex]; ok {
-				if op.Me == rsm.me {
+			if hasCh {
+				if op.Me == me {
 					ch <- result
 				} else {
 					ch <- nil // not my op, so return nil
 				}
-				delete(rsm.notifyCh, msg.CommandIndex)
 			}
 		} else if msg.SnapshotValid {
+			rsm.mu.Lock()
 			rsm.sm.Restore(msg.Snapshot)
+			rsm.mu.Unlock()
 		}
-		rsm.mu.Unlock()
+
+		// Truncate the Raft log if it exceeds maxraftstate.
+		if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() > rsm.maxraftstate {
+			snapshot := rsm.sm.Snapshot()
+			rsm.rf.Snapshot(msg.CommandIndex, snapshot)
+		}
+	}
+
+	for idx, ch := range rsm.notifyCh {
+		// notify all waiting channels that the applyCh is closed
+		// and they should return ErrWrongLeader
+		ch <- nil
+		delete(rsm.notifyCh, idx)
 	}
 }
 
@@ -114,12 +135,17 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	if !isLeader {
 		return rpc.ErrWrongLeader, nil
 	}
-	// log.Printf("RSM[%d] submitted op %v at index %d", rsm.me, op, idx)
 
 	rsm.mu.Lock()
 	ch := make(chan any, 1)
 	rsm.notifyCh[idx] = ch
 	rsm.mu.Unlock()
+
+	defer func() {
+		rsm.mu.Lock()
+		delete(rsm.notifyCh, idx)
+		rsm.mu.Unlock()
+	}()
 
 	select {
 	case result := <-ch:
@@ -128,9 +154,7 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		}
 		return rpc.OK, result
 	case <-time.After(2000 * time.Millisecond):
-		rsm.mu.Lock()
-		delete(rsm.notifyCh, idx)
-		rsm.mu.Unlock()
+
 		return rpc.ErrWrongLeader, nil
 	}
 }
