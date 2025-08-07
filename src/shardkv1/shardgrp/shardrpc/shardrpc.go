@@ -7,10 +7,12 @@ import (
 
 // Same as Put in kvsrv1/rpc, but with a configuration number
 type PutArgs struct {
-	Key     string
-	Value   string
-	Version rpc.Tversion
-	Num     shardcfg.Tnum
+	Key      string
+	Value    string
+	Version  rpc.Tversion
+	Num      shardcfg.Tnum
+	ReqId    int64
+	ClientId int64
 }
 
 // Same as Get in kvsrv1/rpc, but with a configuration number.
