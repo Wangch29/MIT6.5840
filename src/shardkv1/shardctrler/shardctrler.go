@@ -5,16 +5,20 @@ package shardctrler
 //
 
 import (
-
+	"sync"
 	"sync/atomic"
+	"time"
 
-	"6.5840/kvsrv1"
+	kvsrv "6.5840/kvsrv1"
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
+	kvtest "6.5840/kvtest1"
 	"6.5840/shardkv1/shardcfg"
-	"6.5840/tester1"
+	"6.5840/shardkv1/shardgrp"
+	tester "6.5840/tester1"
 )
 
+// key name for shard configuration
+const config_key_name string = "shard_config"
 
 // ShardCtrler for the controller and kv clerk.
 type ShardCtrler struct {
@@ -24,7 +28,7 @@ type ShardCtrler struct {
 	killed int32 // set by Kill()
 	leases bool
 
-	// Your data here.
+	grpsClerks map[tester.Tgid]*shardgrp.Clerk // one clerk for each shard group
 }
 
 // Make a ShardCltler, which stores its state in a kvsrv.
@@ -32,7 +36,7 @@ func MakeShardCtrler(clnt *tester.Clnt, leases bool) *ShardCtrler {
 	sck := &ShardCtrler{clnt: clnt, leases: leases}
 	srv := tester.ServerName(tester.GRP0, 0)
 	sck.IKVClerk = kvsrv.MakeClerk(clnt, srv)
-	// Your code here.
+	sck.grpsClerks = make(map[tester.Tgid]*shardgrp.Clerk)
 	return sck
 }
 
@@ -57,7 +61,18 @@ func (sck *ShardCtrler) ExitController() {
 // then Put it in the kvsrv for the controller at version 0.  You can
 // pick the key to name the configuration.
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
-	// Your code here
+	err := sck.IKVClerk.Put("shard_config", cfg.String(), 0)
+	for err != rpc.OK {
+		err = sck.IKVClerk.Put("shard_config", cfg.String(), 0)
+	}
+	// Initialize the group clerks for each group
+	for gid, servers := range cfg.Groups {
+		if len(servers) == 0 {
+			sck.grpsClerks[gid] = nil // no servers for this shard
+		} else {
+			sck.grpsClerks[gid] = shardgrp.MakeClerk(sck.clnt, servers)
+		}
+	}
 }
 
 // Called by the tester to ask the controller to change the
@@ -66,6 +81,95 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // controller, as in part C.  In all other cases, it should return
 // rpc.OK.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) rpc.Err {
+	old, version := sck.Query()
+
+	if new.Num != old.Num+1 {
+		return rpc.ErrVersion
+	}
+
+	// Try to add new the group clerks.
+	for gid, servers := range new.Groups {
+		oldServers, ok := old.Groups[gid]
+		if !ok {
+			// add a new group
+			sck.grpsClerks[gid] = shardgrp.MakeClerk(sck.clnt, servers)
+		} else {
+			// old group, check if servers are changed.
+			for idx, srv := range servers {
+				if oldServers[idx] != srv {
+					panic("ChangeConfigTo: do not support changing servers in a group")
+				}
+			}
+		}
+	}
+
+	// Migrate shards.
+	var wg sync.WaitGroup
+	for i := 0; i < shardcfg.NShards; i++ {
+		shid := shardcfg.Tshid(i)
+		if new.Shards[shid] != old.Shards[shardcfg.Tshid(i)] {
+			// Shard i is being moved to a different group.
+			// We need to freeze the shard before installing the new configuration.
+			oldGrpId := old.Shards[shid]
+			newGrpId := new.Shards[shid]
+
+			wg.Add(1)
+			go func(shid shardcfg.Tshid, oldGrpId, newGrpId tester.Tgid) {
+				defer wg.Done()
+				// Freeze
+				var shardBytes []byte
+				var err rpc.Err
+				for {
+					shardBytes, err = sck.grpsClerks[oldGrpId].Freeze(shid, old.Num)
+					if err == rpc.OK {
+						break
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+				// Install
+				for {
+					err = sck.grpsClerks[newGrpId].InstallShard(shid, shardBytes, new.Num)
+					if err == rpc.OK {
+						break
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+				// Delete
+				for {
+					err = sck.grpsClerks[oldGrpId].Delete(shid, new.Num)
+					if err == rpc.OK {
+						break
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+			}(shid, oldGrpId, newGrpId)
+		}
+	}
+
+	wg.Wait()
+
+	// Try to delete old group clerks.
+	for gid := range old.Groups {
+		if _, ok := new.Groups[gid]; !ok {
+			delete(sck.grpsClerks, gid)
+		}
+	}
+
+	// Update the configuration in the kvsrv.
+	for {
+		err := sck.IKVClerk.Put(config_key_name, new.String(), version)
+		if err == rpc.OK {
+			break
+		}
+		if err == rpc.ErrMaybe {
+			_, v, err := sck.IKVClerk.Get(config_key_name)
+			if err == rpc.OK && v == version+1 {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	return rpc.OK
 }
 
@@ -81,10 +185,14 @@ func (sck *ShardCtrler) isKilled() bool {
 	return z == 1
 }
 
-
 // Return the current configuration and its version number
 func (sck *ShardCtrler) Query() (*shardcfg.ShardConfig, rpc.Tversion) {
-	// Your code here.
-	return nil, 0
+	for {
+		val, version, err := sck.IKVClerk.Get("shard_config")
+		if err == rpc.OK {
+			return shardcfg.FromString(val), version
+		}
+		// Add delay to avoid overwhelming the server
+		time.Sleep(100 * time.Millisecond)
+	}
 }
-

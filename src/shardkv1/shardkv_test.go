@@ -6,11 +6,11 @@ import (
 	"time"
 
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
+	kvtest "6.5840/kvtest1"
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardctrler"
 	"6.5840/shardkv1/shardctrler/param"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 const (
@@ -51,6 +51,7 @@ func TestInitQuery5A(t *testing.T) {
 // Test shardkv clerk's Get/Put with 1 shardgrp (without reconfiguration)
 func TestStaticOneShardGroup5A(t *testing.T) {
 	ts := MakeTest(t, "Test (5A): one shard group ...", true)
+	tester.AnnotateTest("TestStaticOneShardGroup5A", 1)
 	defer ts.Cleanup()
 
 	// The tester's setupKVService() sets up a kvsrv for the
@@ -80,6 +81,7 @@ func TestStaticOneShardGroup5A(t *testing.T) {
 // shards that moved.
 func TestJoinBasic5A(t *testing.T) {
 	ts := MakeTest(t, "Test (5A): a group joins...", true)
+	tester.AnnotateTest("TestJoinBasic5A", 1)
 	defer ts.Cleanup()
 
 	gid1 := ts.setupKVService()
@@ -105,7 +107,6 @@ func TestJoinBasic5A(t *testing.T) {
 	}
 
 	ts.checkShutdownSharding(gid1, ka, va)
-
 	for i := 0; i < len(ka); i++ {
 		ts.CheckGet(ck, ka[i], va[i], rpc.Tversion(1))
 	}
@@ -125,6 +126,7 @@ func TestDeleteBasic5A(t *testing.T) {
 	)
 
 	ts := MakeTestMaxRaft(t, "Test (5A): delete ...", true, false, VALUESIZE)
+	tester.AnnotateTest("TestDeleteBasic5A", 1)
 	defer ts.Cleanup()
 
 	gid1 := ts.setupKVService()
@@ -157,6 +159,7 @@ func TestDeleteBasic5A(t *testing.T) {
 // test shardctrler's leave
 func TestJoinLeaveBasic5A(t *testing.T) {
 	ts := MakeTest(t, "Test (5A): basic groups join/leave ...", true)
+	tester.AnnotateTest("TestJoinLeaveBasic5A", 1)
 	defer ts.Cleanup()
 
 	gid1 := ts.setupKVService()
@@ -175,7 +178,6 @@ func TestJoinLeaveBasic5A(t *testing.T) {
 	for i := 0; i < len(ka); i++ {
 		ts.CheckGet(ck, ka[i], va[i], rpc.Tversion(1))
 	}
-
 	err = ts.leave(sck, shardcfg.Gid1)
 	if err != rpc.OK {
 		ts.t.Fatalf("Leave: err %v", err)
@@ -207,6 +209,7 @@ func TestJoinLeaveBasic5A(t *testing.T) {
 // test many groups joining and leaving, reliable or unreliable
 func joinLeave5A(t *testing.T, reliable bool, part string) {
 	ts := MakeTest(t, "Test (5A): many groups join/leave ...", reliable)
+	tester.AnnotateTest("joinLeave5A", 1)
 	defer ts.Cleanup()
 
 	ts.setupKVService()
@@ -216,15 +219,25 @@ func joinLeave5A(t *testing.T, reliable bool, part string) {
 	sck := ts.ShardCtrler()
 	grps := ts.groups(NGRP)
 
+	log.Printf("try to join groups")
+
 	ts.joinGroups(sck, grps)
 
+	log.Printf("Check shutdown.")
+
 	ts.checkShutdownSharding(grps[0], ka, va)
+
+	log.Printf("Get all gets.")
 
 	for i := 0; i < len(ka); i++ {
 		ts.CheckGet(ck, ka[i], va[i], rpc.Tversion(1))
 	}
 
+	log.Printf("leave groups.")
+
 	ts.leaveGroups(sck, grps)
+
+	log.Printf("gets after leaving groups.")
 
 	for i := 0; i < len(ka); i++ {
 		ts.CheckGet(ck, ka[i], va[i], rpc.Tversion(1))
@@ -245,6 +258,7 @@ func TestShutdown5A(t *testing.T) {
 	const NGRP = 2 + NJOIN
 
 	ts := MakeTest(t, "Test (5A): shutdown ...", true)
+	tester.AnnotateTest("TestShutdown5A", 1)
 	defer ts.Cleanup()
 
 	ts.setupKVService()
