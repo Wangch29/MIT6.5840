@@ -128,9 +128,9 @@ func (ck *Clerk) Freeze(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.Err) {
 				ck.leaderIdx = idx
 				return reply.State, rpc.OK
 			}
-			if reply.Err == rpc.ErrWrongGroup {
+			if reply.Err == rpc.ErrVersion {
 				ck.leaderIdx = idx
-				return nil, rpc.ErrWrongGroup
+				return nil, rpc.ErrVersion
 			}
 			// Handle ErrWrongLeader by trying next server
 			if reply.Err == rpc.ErrWrongLeader {
@@ -162,9 +162,9 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 				ck.leaderIdx = idx
 				return rpc.OK
 			}
-			if reply.Err == rpc.ErrWrongGroup {
+			if reply.Err == rpc.ErrVersion {
 				ck.leaderIdx = idx
-				return rpc.ErrWrongGroup
+				return rpc.ErrVersion
 			}
 			// Handle ErrWrongLeader by trying next server
 			if reply.Err == rpc.ErrWrongLeader {
@@ -197,9 +197,9 @@ func (ck *Clerk) Delete(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 				ck.leaderIdx = idx
 				return rpc.OK
 			}
-			if reply.Err == rpc.ErrWrongGroup {
+			if reply.Err == rpc.ErrVersion {
 				ck.leaderIdx = idx
-				return rpc.ErrWrongGroup
+				return rpc.ErrVersion
 			}
 			// Handle ErrWrongLeader by trying next server
 			if reply.Err == rpc.ErrWrongLeader {

@@ -167,8 +167,8 @@ func (kv *KVServer) DoOp(req any) any {
 		defer kv.mu.Unlock()
 
 		if kv.shardStates[args.Shard].Num > args.Num {
-			// Shard already has a newer or equal configuration, ignore this request
-			return shardrpc.InstallShardReply{Err: rpc.ErrWrongGroup}
+			// Shard already has a newer configuration; request is stale
+			return shardrpc.InstallShardReply{Err: rpc.ErrVersion}
 		}
 
 		shardId := args.Shard
@@ -190,8 +190,8 @@ func (kv *KVServer) DoOp(req any) any {
 		defer kv.mu.Unlock()
 
 		if kv.shardStates[args.Shard].Num > args.Num {
-			// Shard has a newer configuration, ignore this request
-			return shardrpc.FreezeReply{Err: rpc.ErrWrongGroup}
+			// Shard has a newer configuration, caller sent a stale Num
+			return shardrpc.FreezeReply{Err: rpc.ErrVersion}
 		}
 
 		if _, ok := kv.shardStates[args.Shard]; !ok {
@@ -220,8 +220,8 @@ func (kv *KVServer) DoOp(req any) any {
 		defer kv.mu.Unlock()
 
 		if kv.shardStates[args.Shard].Num > args.Num {
-			// Shard has a newer configuration, ignore this request
-			return shardrpc.DeleteShardReply{Err: rpc.ErrWrongGroup}
+			// Shard has a newer configuration; request is stale
+			return shardrpc.DeleteShardReply{Err: rpc.ErrVersion}
 		}
 
 		if meta, ok := kv.shardStates[args.Shard]; !ok || meta.State == ShardStateServing {

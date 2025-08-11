@@ -19,6 +19,7 @@ import (
 
 // key name for shard configuration
 const config_key_name string = "shard_config"
+const next_config_key_name string = "next_shard_config"
 
 // ShardCtrler for the controller and kv clerk.
 type ShardCtrler struct {
@@ -29,6 +30,105 @@ type ShardCtrler struct {
 	leases bool
 
 	grpsClerks map[tester.Tgid]*shardgrp.Clerk // one clerk for each shard group
+}
+
+// ensureGrpClerksFor makes sure sck.grpsClerks has a clerk for every group in cfg.
+func (sck *ShardCtrler) ensureGrpClerksFor(cfg *shardcfg.ShardConfig) {
+	for gid, servers := range cfg.Groups {
+		if _, ok := sck.grpsClerks[gid]; ok {
+			continue
+		}
+		if len(servers) == 0 {
+			sck.grpsClerks[gid] = nil
+		} else {
+			sck.grpsClerks[gid] = shardgrp.MakeClerk(sck.clnt, servers)
+		}
+	}
+}
+
+// finishReconfig migrates shards from old -> new (idempotent via Num) and then
+// sets the controller's current config to new by CAS on config_key_name using curVersion.
+func (sck *ShardCtrler) finishReconfig(old *shardcfg.ShardConfig, new *shardcfg.ShardConfig, curVersion rpc.Tversion) rpc.Err {
+	// Create clerks for all groups mentioned in either config (needed after a crash).
+	sck.ensureGrpClerksFor(old)
+	sck.ensureGrpClerksFor(new)
+
+	// Migrate shards that change ownership.
+	var wg sync.WaitGroup
+	for i := 0; i < shardcfg.NShards; i++ {
+		shid := shardcfg.Tshid(i)
+		oldGrpId := old.Shards[shid]
+		newGrpId := new.Shards[shid]
+		if oldGrpId == newGrpId {
+			continue
+		}
+		wg.Add(1)
+		go func(shid shardcfg.Tshid, oldGrpId, newGrpId tester.Tgid) {
+			defer wg.Done()
+			// 1) Freeze on old owner using old.Num. Retry until OK, or accept ErrVersion as "already advanced".
+			var shardBytes []byte
+			skipInstall := false
+			for {
+				b, err := sck.grpsClerks[oldGrpId].Freeze(shid, old.Num)
+				if err == rpc.OK {
+					shardBytes = b
+					break
+				}
+				if err == rpc.ErrVersion {
+					// Old group reports a newer state; treat as already frozen/moved.
+					skipInstall = true
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			// 2) Install on new owner with new.Num. Only if we have bytes to install.
+			if !skipInstall {
+				for {
+					err := sck.grpsClerks[newGrpId].InstallShard(shid, shardBytes, new.Num)
+					if err == rpc.OK || err == rpc.ErrVersion {
+						break
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
+
+			// 3) Delete on old owner with new.Num (idempotent). Accept OK or ErrVersion as success.
+			for {
+				err := sck.grpsClerks[oldGrpId].Delete(shid, new.Num)
+				if err == rpc.OK || err == rpc.ErrVersion {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}(shid, oldGrpId, newGrpId)
+	}
+	wg.Wait()
+
+	// Drop clerks for groups that no longer exist in the new config.
+	for gid := range old.Groups {
+		if _, ok := new.Groups[gid]; !ok {
+			delete(sck.grpsClerks, gid)
+		}
+	}
+
+	// Atomically advance current config from old -> new using CAS with curVersion.
+	for {
+		if err := sck.IKVClerk.Put(config_key_name, new.String(), curVersion); err == rpc.OK {
+			break
+		}
+		if err := func() rpc.Err {
+			_, v, e := sck.IKVClerk.Get(config_key_name)
+			if e == rpc.OK && v == curVersion+1 {
+				return rpc.OK
+			}
+			return rpc.ErrMaybe
+		}(); err == rpc.OK {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return rpc.OK
 }
 
 // Make a ShardCltler, which stores its state in a kvsrv.
@@ -48,7 +148,17 @@ func MakeShardCtrler(clnt *tester.Clnt, leases bool) *ShardCtrler {
 // this controller is partitioned during recovery); this happens only
 // in Part C. Otherwise, it returns rpc.OK.
 func (sck *ShardCtrler) InitController() rpc.Err {
-	return rpc.ErrVersion
+	curVal, curVer, _ := sck.IKVClerk.Get(config_key_name)
+	nextVal, _, _ := sck.IKVClerk.Get(next_config_key_name)
+	curCfg := shardcfg.FromString(curVal)
+	nextCfg := shardcfg.FromString(nextVal)
+
+	if nextCfg.Num > curCfg.Num {
+		// A previous controller started a reconfig but didn't finish. Complete it now.
+		return sck.finishReconfig(curCfg, nextCfg, curVer)
+	}
+	// Nothing to recover; either equal or next is stale.
+	return rpc.OK
 }
 
 // The tester calls ExitController to exit a controller. In part B and
@@ -61,10 +171,8 @@ func (sck *ShardCtrler) ExitController() {
 // then Put it in the kvsrv for the controller at version 0.  You can
 // pick the key to name the configuration.
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
-	err := sck.IKVClerk.Put("shard_config", cfg.String(), 0)
-	for err != rpc.OK {
-		err = sck.IKVClerk.Put("shard_config", cfg.String(), 0)
-	}
+	sck.IKVClerk.Put(config_key_name, cfg.String(), 0)
+	sck.IKVClerk.Put(next_config_key_name, cfg.String(), 0)
 	// Initialize the group clerks for each group
 	for gid, servers := range cfg.Groups {
 		if len(servers) == 0 {
@@ -87,88 +195,27 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) rpc.Err {
 		return rpc.ErrVersion
 	}
 
-	// Try to add new the group clerks.
-	for gid, servers := range new.Groups {
-		oldServers, ok := old.Groups[gid]
-		if !ok {
-			// add a new group
-			sck.grpsClerks[gid] = shardgrp.MakeClerk(sck.clnt, servers)
-		} else {
-			// old group, check if servers are changed.
-			for idx, srv := range servers {
-				if oldServers[idx] != srv {
-					panic("ChangeConfigTo: do not support changing servers in a group")
-				}
-			}
-		}
-	}
-
-	// Migrate shards.
-	var wg sync.WaitGroup
-	for i := 0; i < shardcfg.NShards; i++ {
-		shid := shardcfg.Tshid(i)
-		if new.Shards[shid] != old.Shards[shardcfg.Tshid(i)] {
-			// Shard i is being moved to a different group.
-			// We need to freeze the shard before installing the new configuration.
-			oldGrpId := old.Shards[shid]
-			newGrpId := new.Shards[shid]
-
-			wg.Add(1)
-			go func(shid shardcfg.Tshid, oldGrpId, newGrpId tester.Tgid) {
-				defer wg.Done()
-				// Freeze
-				var shardBytes []byte
-				var err rpc.Err
-				for {
-					shardBytes, err = sck.grpsClerks[oldGrpId].Freeze(shid, old.Num)
-					if err == rpc.OK {
-						break
-					}
-					time.Sleep(100 * time.Millisecond)
-				}
-				// Install
-				for {
-					err = sck.grpsClerks[newGrpId].InstallShard(shid, shardBytes, new.Num)
-					if err == rpc.OK {
-						break
-					}
-					time.Sleep(100 * time.Millisecond)
-				}
-				// Delete
-				for {
-					err = sck.grpsClerks[oldGrpId].Delete(shid, new.Num)
-					if err == rpc.OK {
-						break
-					}
-					time.Sleep(100 * time.Millisecond)
-				}
-			}(shid, oldGrpId, newGrpId)
-		}
-	}
-
-	wg.Wait()
-
-	// Try to delete old group clerks.
-	for gid := range old.Groups {
-		if _, ok := new.Groups[gid]; !ok {
-			delete(sck.grpsClerks, gid)
-		}
-	}
-
-	// Update the configuration in the kvsrv.
+	// Write new config.
 	for {
-		err := sck.IKVClerk.Put(config_key_name, new.String(), version)
+		_, ver, _ := sck.IKVClerk.Get(next_config_key_name)
+		err := sck.IKVClerk.Put(next_config_key_name, new.String(), ver)
 		if err == rpc.OK {
 			break
 		}
 		if err == rpc.ErrMaybe {
-			_, v, err := sck.IKVClerk.Get(config_key_name)
-			if err == rpc.OK && v == version+1 {
+			_, v, err := sck.IKVClerk.Get(next_config_key_name)
+			if err == rpc.OK && v == ver+1 {
 				break
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+
+	// Ensure we have clerks for any new groups before migration (finishReconfig also ensures).
+	sck.ensureGrpClerksFor(new)
+
+	// Perform the migration and advance current config.
+	_ = sck.finishReconfig(old, new, version)
 
 	return rpc.OK
 }
@@ -188,7 +235,7 @@ func (sck *ShardCtrler) isKilled() bool {
 // Return the current configuration and its version number
 func (sck *ShardCtrler) Query() (*shardcfg.ShardConfig, rpc.Tversion) {
 	for {
-		val, version, err := sck.IKVClerk.Get("shard_config")
+		val, version, err := sck.IKVClerk.Get(config_key_name)
 		if err == rpc.OK {
 			return shardcfg.FromString(val), version
 		}

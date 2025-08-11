@@ -219,25 +219,15 @@ func joinLeave5A(t *testing.T, reliable bool, part string) {
 	sck := ts.ShardCtrler()
 	grps := ts.groups(NGRP)
 
-	log.Printf("try to join groups")
-
 	ts.joinGroups(sck, grps)
 
-	log.Printf("Check shutdown.")
-
 	ts.checkShutdownSharding(grps[0], ka, va)
-
-	log.Printf("Get all gets.")
 
 	for i := 0; i < len(ka); i++ {
 		ts.CheckGet(ck, ka[i], va[i], rpc.Tversion(1))
 	}
 
-	log.Printf("leave groups.")
-
 	ts.leaveGroups(sck, grps)
-
-	log.Printf("gets after leaving groups.")
 
 	for i := 0; i < len(ka); i++ {
 		ts.CheckGet(ck, ka[i], va[i], rpc.Tversion(1))
@@ -506,6 +496,7 @@ func TestJoinLeave5B(t *testing.T) {
 	const NSEC = 2
 
 	ts := MakeTest(t, "Test (5B): Join/leave while a shardgrp is down...", true)
+	tester.AnnotateTest("TestJoinLeave5B", 1)
 	defer ts.Cleanup()
 
 	gid1 := ts.setupKVService()
@@ -586,6 +577,7 @@ func TestRecoverCtrler5B(t *testing.T) {
 	)
 
 	ts := MakeTest(t, "Test (5B): recover controller ...", true)
+	tester.AnnotateTest("TestRecoverCtrler5B", 1)
 	defer ts.Cleanup()
 
 	gid := ts.setupKVService()
