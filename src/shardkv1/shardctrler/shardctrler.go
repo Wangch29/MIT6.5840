@@ -112,28 +112,32 @@ func (sck *ShardCtrler) finishReconfig(old *shardcfg.ShardConfig, new *shardcfg.
 		}
 	}
 
-	// Atomically advance current config from old -> new using CAS with curVersion.
+	// Atomically advance current config from old -> new.
 	for {
-		if err := sck.IKVClerk.Put(config_key_name, new.String(), curVersion); err == rpc.OK {
+		err := sck.IKVClerk.Put(config_key_name, new.String(), curVersion)
+		if err == rpc.OK {
+			// log.Printf("put config_key_name success, to version %v", curVersion)
 			break
 		}
-		if err := func() rpc.Err {
+		if err == rpc.ErrVersion {
+			// val, v, _ := sck.IKVClerk.Get(config_key_name)
+			// log.Printf("put config_key_name ErrVersion, curVersion: %v. Num: %v, version: %v", curVersion, shardcfg.FromString(val).Num, v)
+		}
+		if err == rpc.ErrMaybe {
 			_, v, e := sck.IKVClerk.Get(config_key_name)
 			if e == rpc.OK && v == curVersion+1 {
-				return rpc.OK
+				break
 			}
-			return rpc.ErrMaybe
-		}(); err == rpc.OK {
-			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+
 	return rpc.OK
 }
 
 // Make a ShardCltler, which stores its state in a kvsrv.
-func MakeShardCtrler(clnt *tester.Clnt, leases bool) *ShardCtrler {
-	sck := &ShardCtrler{clnt: clnt, leases: leases}
+func MakeShardCtrler(clnt *tester.Clnt) *ShardCtrler {
+	sck := &ShardCtrler{clnt: clnt}
 	srv := tester.ServerName(tester.GRP0, 0)
 	sck.IKVClerk = kvsrv.MakeClerk(clnt, srv)
 	sck.grpsClerks = make(map[tester.Tgid]*shardgrp.Clerk)
@@ -189,23 +193,41 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // controller, as in part C.  In all other cases, it should return
 // rpc.OK.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) rpc.Err {
-	old, version := sck.Query()
+	// Get old config.
+	var old *shardcfg.ShardConfig
+	for {
+		val, _, err := sck.IKVClerk.Get(config_key_name)
+		// log.Printf("get config_key_name, Num: %v, version: %v", shardcfg.FromString(val).Num, v)
+		if err == rpc.OK {
+			old = shardcfg.FromString(val)
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	if new.Num != old.Num+1 {
 		return rpc.ErrVersion
 	}
 
-	// Write new config.
+	// write next_config_key_name
+	new_string := new.String()
 	for {
-		_, ver, _ := sck.IKVClerk.Get(next_config_key_name)
-		err := sck.IKVClerk.Put(next_config_key_name, new.String(), ver)
+		err := sck.IKVClerk.Put(next_config_key_name, new_string, rpc.Tversion(old.Num))
 		if err == rpc.OK {
 			break
 		}
+		if err == rpc.ErrVersion {
+			return rpc.ErrVersion
+		}
 		if err == rpc.ErrMaybe {
-			_, v, err := sck.IKVClerk.Get(next_config_key_name)
-			if err == rpc.OK && v == ver+1 {
-				break
+			val, v, gerr := sck.IKVClerk.Get(next_config_key_name)
+			if gerr == rpc.OK {
+				if v == rpc.Tversion(old.Num)+1 && new_string == val {
+					break
+				}
+				if v > rpc.Tversion(old.Num)+1 || new_string != val {
+					return rpc.ErrVersion
+				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -215,7 +237,7 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) rpc.Err {
 	sck.ensureGrpClerksFor(new)
 
 	// Perform the migration and advance current config.
-	_ = sck.finishReconfig(old, new, version)
+	_ = sck.finishReconfig(old, new, rpc.Tversion(old.Num))
 
 	return rpc.OK
 }
@@ -233,11 +255,11 @@ func (sck *ShardCtrler) isKilled() bool {
 }
 
 // Return the current configuration and its version number
-func (sck *ShardCtrler) Query() (*shardcfg.ShardConfig, rpc.Tversion) {
+func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
 	for {
-		val, version, err := sck.IKVClerk.Get(config_key_name)
+		val, _, err := sck.IKVClerk.Get(config_key_name)
 		if err == rpc.OK {
-			return shardcfg.FromString(val), version
+			return shardcfg.FromString(val)
 		}
 		// Add delay to avoid overwhelming the server
 		time.Sleep(100 * time.Millisecond)

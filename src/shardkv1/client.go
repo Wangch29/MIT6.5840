@@ -33,7 +33,7 @@ func MakeClerk(clnt *tester.Clnt, sck *shardctrler.ShardCtrler) kvtest.IKVClerk 
 		grpsClerks: make(map[tester.Tgid]*shardgrp.Clerk),
 	}
 
-	cfg, _ := sck.Query()
+	cfg := sck.Query()
 	ck.Cfg = cfg
 
 	for gid, servers := range cfg.Groups {
@@ -56,7 +56,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	for {
 		// log.Printf("Clerk.Get: key=%s\n", key)
 
-		cfg, _ := ck.sck.Query()
+		cfg := ck.sck.Query()
 		if cfg.Num > ck.Cfg.Num {
 			ck.updateConfig()
 			continue
@@ -124,7 +124,7 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 }
 
 func (ck *Clerk) updateConfig() {
-	cfg, _ := ck.sck.Query()
+	cfg := ck.sck.Query()
 	ck.Cfg = cfg
 	// Clear old grpsClerks mapping
 	ck.grpsClerks = make(map[tester.Tgid]*shardgrp.Clerk)

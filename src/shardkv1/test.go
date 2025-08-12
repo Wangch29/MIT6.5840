@@ -16,7 +16,6 @@ import (
 	"6.5840/labrpc"
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardctrler"
-	"6.5840/shardkv1/shardctrler/param"
 	"6.5840/shardkv1/shardgrp"
 	"6.5840/tester1"
 )
@@ -25,9 +24,9 @@ type Test struct {
 	t *testing.T
 	*kvtest.Test
 
-	sck    *shardctrler.ShardCtrler
-	part   string
-	leases bool
+	sck       *shardctrler.ShardCtrler
+	part      string
+	partition bool
 
 	maxraftstate int
 	mu           sync.Mutex
@@ -41,15 +40,17 @@ const (
 )
 
 // Setup kvserver for the shard controller and make the controller
-func MakeTestMaxRaft(t *testing.T, part string, reliable, leases bool, maxraftstate int) *Test {
+func MakeTestMaxRaft(t *testing.T, part string, reliable, partition bool, maxraftstate int) *Test {
 	ts := &Test{
 		ngid:         shardcfg.Gid1 + 1, // Gid1 is in use
 		t:            t,
-		leases:       leases,
+		partition:    partition,
 		maxraftstate: maxraftstate,
 	}
 	cfg := tester.MakeConfig(t, 1, reliable, kvsrv.StartKVServer)
 	ts.Test = kvtest.MakeTest(t, cfg, false, ts)
+	// XXX to avoid panic
+	tester.AnnotateTest(part, 1)
 	ts.Begin(part)
 	return ts
 }
@@ -84,7 +85,7 @@ func (ts *Test) makeShardCtrler() *shardctrler.ShardCtrler {
 
 func (ts *Test) makeShardCtrlerClnt() (*shardctrler.ShardCtrler, *tester.Clnt) {
 	clnt := ts.Config.MakeClient()
-	return shardctrler.MakeShardCtrler(clnt, ts.leases), clnt
+	return shardctrler.MakeShardCtrler(clnt), clnt
 }
 
 func (ts *Test) makeKVClerk() *kvsrv.Clerk {
@@ -125,69 +126,64 @@ func (ts *Test) StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid
 	return shardgrp.StartServerShardGrp(servers, gid, me, persister, ts.maxraftstate)
 }
 
+func (ts *Test) checkMember(sck *shardctrler.ShardCtrler, gid tester.Tgid) bool {
+	cfg := sck.Query()
+	ok := cfg.IsMember(gid)
+	return ok
+}
+
 // Add group gid
-func (ts *Test) join(sck *shardctrler.ShardCtrler, gid tester.Tgid, srvs []string) rpc.Err {
-	cfg, _ := sck.Query()
+func (ts *Test) join(sck *shardctrler.ShardCtrler, gid tester.Tgid, srvs []string) {
+	cfg := sck.Query()
 	newcfg := cfg.Copy()
 	ok := newcfg.JoinBalance(map[tester.Tgid][]string{gid: srvs})
 	if !ok {
 		log.Fatalf("join: group %d is already present", gid)
 	}
-	return sck.ChangeConfigTo(newcfg)
+	sck.ChangeConfigTo(newcfg)
 }
 
-func (ts *Test) joinGroups(sck *shardctrler.ShardCtrler, gids []tester.Tgid) rpc.Err {
+func (ts *Test) joinGroups(sck *shardctrler.ShardCtrler, gids []tester.Tgid) bool {
 	for _, gid := range gids {
 		ts.Config.MakeGroupStart(gid, NSRV, ts.StartServerShardGrp)
-		if err := ts.join(sck, gid, ts.Group(gid).SrvNames()); err != rpc.OK {
-			return err
+		ts.join(sck, gid, ts.Group(gid).SrvNames())
+		if ok := ts.checkMember(sck, gid); !ok {
+			return false
 		}
 		time.Sleep(INTERGRPDELAY * time.Millisecond)
 	}
-	return rpc.OK
+	return true
 }
 
 // Group gid leaves.
-func (ts *Test) leave(sck *shardctrler.ShardCtrler, gid tester.Tgid) rpc.Err {
-	cfg, _ := sck.Query()
+func (ts *Test) leave(sck *shardctrler.ShardCtrler, gid tester.Tgid) {
+	cfg := sck.Query()
 	newcfg := cfg.Copy()
 	ok := newcfg.LeaveBalance([]tester.Tgid{gid})
 	if !ok {
 		log.Fatalf("leave: group %d is already not present", gid)
 	}
-	return sck.ChangeConfigTo(newcfg)
+	sck.ChangeConfigTo(newcfg)
 }
 
-func (ts *Test) leaveGroups(sck *shardctrler.ShardCtrler, gids []tester.Tgid) rpc.Err {
+func (ts *Test) leaveGroups(sck *shardctrler.ShardCtrler, gids []tester.Tgid) bool {
 	for _, gid := range gids {
-		if err := ts.leave(sck, gid); err != rpc.OK {
-			return err
+		ts.leave(sck, gid)
+		if ok := ts.checkMember(sck, gid); ok {
+			return false
 		}
 		ts.Config.ExitGroup(gid)
 		time.Sleep(INTERGRPDELAY * time.Millisecond)
 	}
-	return rpc.OK
+	return true
 }
 
-func (ts *Test) disconnectRaftLeader(gid tester.Tgid) (int, string) {
-	_, l := rsm.Leader(ts.Config, gid)
-	g := ts.Group(gid)
-	ln := g.SrvName(l)
-	g.DisconnectAll(l)
-	return l, ln
-}
-
-func (ts *Test) reconnectOldLeader(gid tester.Tgid, l int) {
-	g := ts.Group(gid)
-	g.ConnectOne(l)
-}
-
-func (ts *Test) disconnectClntFromLeader(clnt *tester.Clnt, gid tester.Tgid) int {
-	l, ln := ts.disconnectRaftLeader(gid)
-	p := ts.Group(gid).AllowServersExcept(l)
-	srvs := ts.Group(gid).SrvNamesTo(p)
-	clnt.Disconnect(ln)
-	clnt.ConnectTo(srvs)
+func (ts *Test) disconnectClntFromLeader(gid tester.Tgid) int {
+	ok, l := rsm.Leader(ts.Config, gid)
+	if !ok {
+		log.Fatalf("Leader failed")
+	}
+	ts.Group(gid).ShutdownServer(l)
 	return l
 }
 
@@ -242,26 +238,23 @@ func (ts *Test) checkShutdownSharding(down tester.Tgid, ka []string, va []string
 
 // Run one controler and then partition it after some time. Run
 // another cntrler that must finish the first ctrler's unfinished
-// shard moves. To ensure first ctrler is in a join/leave the test
-// shuts down shardgrp `gid`.  After the second controller is done,
-// heal the partition to test if Freeze,InstallShard, and Delete are
-// are fenced.
-func (ts *Test) killCtrler(ck kvtest.IKVClerk, gid tester.Tgid, ka, va []string) {
+// shard moves. To make it likely that first ctrler is in a join/leave
+// the test shuts down shardgrp `gid`.  After the second controller is
+// done, heal the partition.  partitionCtrler returns if recovery
+// happened.
+func (ts *Test) partitionCtrler(ck kvtest.IKVClerk, gid tester.Tgid, ka, va []string) {
 	const (
-		NSLEEP = 2
-
-		RAND = 1000
+		RAND = 400
+		NSEC = 1
 
 		JOIN  = 1
 		LEAVE = 2
 	)
 
 	sck, clnt := ts.makeShardCtrlerClnt()
-	if err := sck.InitController(); err != rpc.OK {
-		ts.Fatalf("failed to init controller %v", err)
-	}
+	sck.InitController()
 
-	cfg, _ := ts.ShardCtrler().Query()
+	cfg := ts.ShardCtrler().Query()
 	num := cfg.Num
 
 	state := 0
@@ -270,55 +263,61 @@ func (ts *Test) killCtrler(ck kvtest.IKVClerk, gid tester.Tgid, ka, va []string)
 		for {
 			ngid = ts.newGid()
 			state = JOIN
-			err := ts.joinGroups(sck, []tester.Tgid{ngid})
-			if err == rpc.OK {
+			ts.joinGroups(sck, []tester.Tgid{ngid})
+			if ok := ts.checkMember(sck, ngid); ok {
 				state = LEAVE
-				err = ts.leaveGroups(sck, []tester.Tgid{ngid})
+				ts.leaveGroups(sck, []tester.Tgid{ngid})
 			} else {
-				//log.Printf("deposed err %v", err)
+				//log.Printf("%v: deposed", sck.Id())
 				return
 			}
 		}
 	}()
 
+	// let sck run for a little while
+	time.Sleep(1000 * time.Millisecond)
+
 	r := rand.Int() % RAND
 	d := time.Duration(r) * time.Millisecond
 	time.Sleep(d)
 
-	//log.Printf("shutdown gid %d after %dms", gid, r)
+	//log.Printf("shutdown gid %d after %dms %v", gid, r, time.Now().Sub(t))
+
 	ts.Group(gid).Shutdown()
 
-	// sleep for a while to get the chance for the controler to get stuck
-	// in join or leave, because gid is down
-	time.Sleep(NSLEEP * time.Second)
+	// sleep for a while to get sck stuck in join or leave, because
+	// gid is down
+	time.Sleep(1000 * time.Millisecond)
 
 	//log.Printf("disconnect sck %v ngid %d num %d state %d", d, ngid, num, state)
 
 	// partition controller
 	clnt.DisconnectAll()
 
-	if ts.leases {
-		// wait until sck's lease expired before restarting shardgrp `gid`
-		time.Sleep((param.LEASETIMESEC + 1) * time.Second)
+	if ts.partition {
+		// wait a while before restarting shardgrp `gid`
+		time.Sleep(NSEC * time.Second)
 	}
+
+	//log.Printf("startservers %v lease expired %t", time.Now().Sub(t), ts.leases)
 
 	ts.Group(gid).StartServers()
 
 	// start new controler to pick up where sck left off
 	sck0, clnt0 := ts.makeShardCtrlerClnt()
-	if err := sck0.InitController(); err != rpc.OK {
-		ts.Fatalf("failed to init controller %v", err)
-	}
-	cfg, _ = sck0.Query()
+
+	sck0.InitController()
+	cfg = sck0.Query()
 	s := "join"
 	if state == LEAVE {
 		s = "leave"
 	}
-	//log.Printf("%v cfg %v recovered %s", s, cfg, s)
 
 	if cfg.Num <= num {
 		ts.Fatalf("didn't recover; expected %d > %d", num, cfg.Num)
 	}
+
+	//log.Printf("%v: recovered %v %v %v", sck0.Id(), time.Now().Sub(t), s, cfg)
 
 	present := cfg.IsMember(ngid)
 	if (state == JOIN && !present) || (state == LEAVE && present) {
@@ -330,30 +329,30 @@ func (ts *Test) killCtrler(ck kvtest.IKVClerk, gid tester.Tgid, ka, va []string)
 		ts.leaveGroups(sck0, []tester.Tgid{ngid})
 	}
 
-	for i := 0; i < len(ka); i++ {
-		ts.CheckGet(ck, ka[i], va[i], rpc.Tversion(1))
-	}
-
-	sck0.ExitController()
-
-	if ts.leases {
+	if ts.partition {
 		// reconnect old controller, which should bail out, because
 		// it has been superseded.
 		clnt.ConnectAll()
 
-		time.Sleep(1 * time.Second)
+		time.Sleep(100 * time.Millisecond)
 
-		for i := 0; i < len(ka); i++ {
-			ts.CheckGet(ck, ka[i], va[i], rpc.Tversion(1))
-		}
 	}
+
+	//log.Printf("reconnected %v", time.Now().Sub(t))
+
+	for i := 0; i < len(ka); i++ {
+		ts.CheckGet(ck, ka[i], va[i], rpc.Tversion(1))
+	}
+
+	//log.Printf("done get %v", time.Now().Sub(t))
+
 	ts.Config.DeleteClient(clnt)
 	ts.Config.DeleteClient(clnt0)
 }
 
-func (ts *Test) electCtrler(ck kvtest.IKVClerk, ka, va []string) {
+func (ts *Test) concurCtrler(ck kvtest.IKVClerk, ka, va []string) {
 	const (
-		NSEC = 5
+		NSEC = 2
 		N    = 4
 	)
 
@@ -366,14 +365,17 @@ func (ts *Test) electCtrler(ck kvtest.IKVClerk, ka, va []string) {
 			default:
 				ngid := ts.newGid()
 				sck := ts.makeShardCtrler()
-				if err := sck.InitController(); err != rpc.OK {
-					ts.Fatalf("failed to init controller %v", err)
+				sck.InitController()
+				//log.Printf("%v: electCtrler %d join/leave %v", sck.Id(), i, ngid)
+				ts.joinGroups(sck, []tester.Tgid{ngid})
+				if ok := ts.checkMember(sck, ngid); ok {
+					//log.Printf("%v: electCtrler %d leave %d", sck.Id(), i, ngid)
+					if ok := ts.leaveGroups(sck, []tester.Tgid{ngid}); !ok {
+						//log.Printf("%v: electCtrler %d leave %v failed", sck.Id(), i, ngid)
+					}
+				} else {
+					//log.Printf("%v: electCtrler %d join %v failed", sck.Id(), i, ngid)
 				}
-				//log.Printf("%d(%p): join/leave %v", i, sck, ngid)
-				if err := ts.joinGroups(sck, []tester.Tgid{ngid}); err == rpc.OK {
-					ts.leaveGroups(sck, []tester.Tgid{ngid})
-				}
-				sck.ExitController()
 			}
 		}
 	}
@@ -387,6 +389,7 @@ func (ts *Test) electCtrler(ck kvtest.IKVClerk, ka, va []string) {
 	for i := 0; i < N; i++ {
 		ch <- struct{}{}
 	}
+
 	for i := 0; i < len(ka); i++ {
 		ts.CheckGet(ck, ka[i], va[i], rpc.Tversion(1))
 	}

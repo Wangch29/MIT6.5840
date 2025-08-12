@@ -69,7 +69,7 @@ func (kv *KVServer) DoOp(req any) any {
 		shardId := shardcfg.Key2Shard(args.Key)
 		if kv.shardStates[shardId].Num > args.Num {
 			// Configuration is not newer, ignore
-			res := rpc.PutReply{Err: rpc.ErrWrongGroup}
+			res := rpc.PutReply{Err: rpc.ErrVersion}
 			kv.clientPutResults[args.ClientId] = ClientPutResult{
 				ReqId:  args.ReqId,
 				Result: res,
@@ -170,6 +170,9 @@ func (kv *KVServer) DoOp(req any) any {
 			// Shard already has a newer configuration; request is stale
 			return shardrpc.InstallShardReply{Err: rpc.ErrVersion}
 		}
+		/* if kv.shardStates[args.Shard].Num == args.Num {
+			return shardrpc.InstallShardReply{Err: rpc.OK}
+		} */
 
 		shardId := args.Shard
 		kv.shardStates[shardId] = ShardMeta{ShardStateServing, args.Num}
@@ -195,7 +198,7 @@ func (kv *KVServer) DoOp(req any) any {
 		}
 
 		if _, ok := kv.shardStates[args.Shard]; !ok {
-			// Shard must be serving before freezing
+			// Shard must be existed before freezing
 			return shardrpc.FreezeReply{Err: rpc.ErrWrongGroup}
 		}
 
@@ -223,6 +226,9 @@ func (kv *KVServer) DoOp(req any) any {
 			// Shard has a newer configuration; request is stale
 			return shardrpc.DeleteShardReply{Err: rpc.ErrVersion}
 		}
+		/* if kv.shardStates[args.Shard].Num == args.Num {
+			return shardrpc.DeleteShardReply{Err: rpc.OK}
+		} */
 
 		if meta, ok := kv.shardStates[args.Shard]; !ok || meta.State == ShardStateServing {
 			// Shard must be frozen before deletion
